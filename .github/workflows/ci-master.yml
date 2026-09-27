@@ -130,8 +130,11 @@ jobs:
   # drill does not appear in PR checks. No cache steps because the VM's
   # persistent pnpm store and tool caches make them redundant (and saving here
   # would poison the hosted cache namespace with self-hosted paths).
+  # Fork-local: disabled. This drill proves the in-house self-hosted pool's
+  # readiness, which a fork does not have, and its unsharded serial aggregate
+  # (every worker pinned to 1) does not fit a hosted runner's budget.
   serial-linux-selfhosted:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    if: false
     name: serial / linux (self-hosted standby)
     runs-on: [self-hosted, linux, x64, vm-backup]
     steps:
@@ -224,8 +227,11 @@ jobs:
   # because the VM's persistent pnpm store and tool caches make them redundant
   # (and saving here would poison the hosted cache namespace with self-hosted
   # paths).
+  # Fork-local: disabled. This drill proves the in-house self-hosted Windows
+  # pool's readiness, which a fork does not have, and the complete Windows gate
+  # inventory does not fit the 120-minute budget on a hosted runner.
   serial-windows:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    if: false
     name: serial / windows (self-hosted standby)
     runs-on: [self-hosted, dsh-win-ci, windows]
     timeout-minutes: 120
