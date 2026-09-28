@@ -1,0 +1,246 @@
+name: CD (deploy dsh web)
+
+# Builds the dsh web GUI on a GitHub-hosted runner and syncs the built tree to
+# the VPS at 175.178.82.150, then restarts dsh-web.service.
+#
+# The build deliberately does NOT run on the server. That VPS has 3.6 GiB of RAM
+# while build:lib:host asks for a 4 GiB heap, and the memory pressure of a full
+# monorepo build there would risk the OOM killer reaching the co-located blog's
+# MySQL. Node 22 matches both the upstream `node-compat` gate (which builds on
+# 22.19) and the server's own /opt/node22.
+#
+# The server keeps a warm dependency install; only the built tree is transferred.
+# The tree is synced whole rather than as a file allowlist: apps/cli/lib holds
+# content-hashed rolldown chunks, and packages/api/*/package.json maps runtime
+# `exports` defaults into lib/types/*.js, so both are easy to omit by accident.
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: >-
+          Commit SHA or branch to deploy. Pass a previous SHA to roll back: the
+          built artifacts are gitignored, so a rollback must rebuild them.
+        required: false
+        default: ''
+
+# One deploy at a time. The remote restart and health check are not reentrant,
+# and a cancelled deploy would leave the service mid-restart.
+concurrency:
+  group: cd-dsh-web
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  DEPLOY_HOST: 175.178.82.150
+  DEPLOY_USER: ubuntu
+  APP_DIR: /opt/dsh/app
+  SERVICE: dsh-web
+  BUILD_NODE_VERSION: '22'
+  DSH_TELEMETRY_DISABLED: '1'
+
+jobs:
+  deploy:
+    name: Build and deploy dsh web
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check out the deployed revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      # The version comes from the root manifest's packageManager field.
+      - uses: pnpm/action-setup@v4
+        with:
+          dest: ${{ runner.temp }}/setup-pnpm-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # No caching: deploys run on pushes to master rather than on every commit,
+      # so a cold install costs a couple of minutes and buys one less moving part.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.BUILD_NODE_VERSION }}
+
+      - name: Install dependencies
+        env:
+          CI: 'true'
+          # The harness needs no browser; playwright's postinstall is pure cost.
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        env:
+          CI: 'true'
+        run: pnpm run build
+
+      # A tree missing any of these boots to a module-resolution failure on the
+      # server, where the diagnostics are far worse than here.
+      - name: Verify the built tree is complete
+        run: |
+          set -euo pipefail
+          fail() { echo "built tree incomplete: $1" >&2; exit 1; }
+          test -f apps/cli/lib/bin.js || fail 'apps/cli/lib/bin.js'
+          test -f apps/web/dist/index.html || fail 'apps/web/dist/index.html'
+          test -f packages/bundle/base/lib/index.js || fail 'packages/bundle/base/lib/index.js'
+          test -f packages/bundle/base/cordis.patch.yml || fail 'packages/bundle/base/cordis.patch.yml'
+          test -f packages/bundle/web-app/lib/startup.js || fail 'packages/bundle/web-app/lib/startup.js'
+          test -f packages/client/ui-theme/lib/client.js || fail 'a client plugin bundle'
+          test -f packages/api/gateway/lib/types/types.js || fail 'packages/api/gateway/lib/types/types.js'
+          test -f vendor/cordis/lib/index.js || fail 'vendor/cordis/lib/index.js'
+          test -f native/system/packages/linux-x64/bin/glibc/system.node || fail 'the Linux flock addon'
+          # bin.js dynamically imports these; a missing chunk is a boot failure.
+          ls apps/cli/lib/*-*.js >/dev/null 2>&1 || fail 'apps/cli hashed chunks'
+          echo "built tree complete"
+
+      - name: Set up SSH
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/dsh_deploy
+          chmod 600 ~/.ssh/dsh_deploy
+          printf '%s\n' "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          ssh -i ~/.ssh/dsh_deploy -o IdentitiesOnly=yes -o BatchMode=yes \
+            "${{ env.DEPLOY_USER }}@${{ env.DEPLOY_HOST }}" true
+          echo "SSH connection established"
+
+      # Whole-tree sync. --exclude also protects those paths from --delete, so
+      # the server's node_modules and its git metadata survive.
+      - name: Sync the built tree
+        run: |
+          set -euo pipefail
+          rsync -az --delete --stats \
+            -e "ssh -i ~/.ssh/dsh_deploy -o IdentitiesOnly=yes" \
+            --exclude '.git/' \
+            --exclude 'node_modules/' \
+            --exclude '.github/' \
+            --exclude 'website/' \
+            --exclude 'snapshots/' \
+            --exclude 'benchmarks/' \
+            --exclude 'python/' \
+            --exclude 'docs/' \
+            --exclude '.agents/' \
+            --exclude '*.tsbuildinfo' \
+            ./ "${{ env.DEPLOY_USER }}@${{ env.DEPLOY_HOST }}:${{ env.APP_DIR }}/"
+
+      # The key is rewritten wholesale into a file the deployment owns, so edits
+      # to the server's own dsh.env survive every deploy. Piped over stdin: it
+      # never reaches an argument vector.
+      - name: Sync the model API key
+        env:
+          API_KEY: ${{ secrets.DEEPSEEK_API_KEY_EXTERNAL }}
+        run: |
+          set -euo pipefail
+          test -n "$API_KEY" || { echo 'DEEPSEEK_API_KEY_EXTERNAL is empty' >&2; exit 1; }
+          printf 'DEEPSEEK_API_KEY=%s\n' "$API_KEY" | \
+            ssh -i ~/.ssh/dsh_deploy -o IdentitiesOnly=yes \
+              "${{ env.DEPLOY_USER }}@${{ env.DEPLOY_HOST }}" \
+              'umask 077; sudo -n tee /opt/dsh/secrets.env >/dev/null && sudo -n chown root:root /opt/dsh/secrets.env && sudo -n chmod 600 /opt/dsh/secrets.env && echo "secrets.env written"'
+
+      # Dependency install when the lockfile moved, the sandbox gate, the
+      # restart, the health check, and the blog regression check.
+      - name: Deploy and verify
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/dsh_deploy -o IdentitiesOnly=yes \
+            "${{ env.DEPLOY_USER }}@${{ env.DEPLOY_HOST }}" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          APP=/opt/dsh/app
+          export PATH=/opt/node22/bin:/usr/local/bin:/usr/bin:/bin
+          export CI=true
+          export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+          cd "$APP"
+
+          echo "::group::dependencies"
+          NOW=$(sha256sum pnpm-lock.yaml | cut -d' ' -f1)
+          BEFORE=$(cat /opt/dsh/.lock-sha256 2>/dev/null || true)
+          if [ "$NOW" != "$BEFORE" ]; then
+            echo "lockfile changed; installing dependencies"
+            pnpm install --frozen-lockfile
+            printf '%s\n' "$NOW" > /opt/dsh/.lock-sha256
+          else
+            echo "lockfile unchanged; skipping install"
+          fi
+          echo "::endgroup::"
+
+          echo "::group::sandbox gate"
+          # The agent's shell tool fails closed without a usable sandbox backend.
+          # build:lib never compiles the musl landlock rung, so bwrap is the only
+          # available one and a broken probe must stop the deploy loudly.
+          sudo -n -u dsh bwrap --ro-bind / / --dev /dev --unshare-pid \
+            --proc /proc --die-with-parent -- true
+          echo "bwrap probe passed"
+          echo "::endgroup::"
+
+          echo "::group::restart"
+          sudo -n systemctl enable dsh-web >/dev/null 2>&1 || true
+          sudo -n systemctl restart dsh-web
+          echo "restart issued"
+          echo "::endgroup::"
+
+          echo "::group::health check"
+          # A request without the launch token answers 401 by design, so 401 is
+          # the healthy signal. Requiring 200 here would roll back working code.
+          CODE=000
+          OK=''
+          for i in $(seq 1 60); do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:3080/ || echo 000)
+            case "$CODE" in
+              200|302|401) OK=yes; echo "service answered HTTP $CODE after ${i}s"; break ;;
+            esac
+            sleep 1
+          done
+          if [ -z "$OK" ]; then
+            echo "service did not answer on 127.0.0.1:3080 within 60s (last HTTP $CODE)" >&2
+            sudo -n systemctl --no-pager --full status dsh-web || true
+            sudo -n journalctl -u dsh-web -n 120 --no-pager || true
+            exit 1
+          fi
+          echo "::endgroup::"
+
+          echo "::group::blog regression check"
+          for h in xiaonong.cloud eblog.site; do
+            c=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: $h" http://127.0.0.1/ || echo 000)
+            echo "  $h -> $c"
+            case "$c" in
+              200|301|302) ;;
+              *) echo "blog regression: $h answered $c" >&2; exit 1 ;;
+            esac
+          done
+          sudo -n systemctl is-active nginx eblog mysql >/dev/null || {
+            echo 'a co-located service is not active' >&2
+            sudo -n systemctl is-active nginx eblog mysql || true
+            exit 1
+          }
+          echo "blog and co-located services unaffected"
+          echo "::endgroup::"
+
+          echo "deploy complete"
+          REMOTE
+
+      # The launch token is minted per process and only accepted on GET /. It is
+      # exchanged for a signed 30-day cookie whose signing secret persists in
+      # $DSH_HOME, so a redeploy does not invalidate an existing browser session.
+      - name: Report the login URL
+        if: success()
+        run: |
+          set -euo pipefail
+          {
+            echo '### dsh web deployed'
+            echo
+            URL=$(ssh -i ~/.ssh/dsh_deploy -o IdentitiesOnly=yes \
+              "${{ env.DEPLOY_USER }}@${{ env.DEPLOY_HOST }}" \
+              '/opt/dsh/dsh-login-url.sh') || URL='(could not read the startup URL from the journal)'
+            echo 'Open this once. It exchanges the launch token for a 30-day cookie,'
+            echo 'then redirects to the clean URL. nginx asks for the Basic Auth'
+            echo 'account before the app sees the token.'
+            echo
+            echo '```'
+            echo "$URL"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
